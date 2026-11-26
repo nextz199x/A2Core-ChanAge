@@ -288,12 +288,14 @@ public sealed partial class GameSession(GameData data, GameSessionOptions option
     /// </summary>
     /// <summary>Default 0: accept the client's auto CombatDodge after 0x3704 (NormalDodge dash + sustained sprint).</summary>
     public int DashVariant { get; set; } = 0;
-    public const int DashVariantMax = 10, DodgeLateEndMs = 600, DashBatchDelayMs = 50, SprintReplyHoldMs = 80;
+    public const int DashVariantMax = 11, DodgeLateEndMs = 600, DashBatchDelayMs = 50, SprintReplyHoldMs = 80;
     /// <summary>CombatDodge right after 0x3704 skips MinCastGap and dodge cooldown (official sprint-opening dash).</summary>
     public const int SprintAutoDodgeWindowMs = 250;
     /// <summary>Sprint-on reply (and, for variant 8, the dash) waiting to share one write. Official sends them at one timestamp.</summary>
     List<byte[]>? pendingSprintReply, pendingDashBatch;
     long sprintOnAt;
+    /// <summary>One re-assert per sprint start (variant 11): the client's opening roll is answered once.</summary>
+    bool sprintReassertUsed;
     /// <summary>The standing dodge's pending effect: the start's action uid and when it is due.</summary>
     (int Action, long At)? dodgeEffectAt;
     /// <summary>Seconds spent gliding, flying or swimming since the last whole minute counted (ElapsedTime achievements).</summary>
@@ -622,6 +624,11 @@ public sealed partial class GameSession(GameData data, GameSessionOptions option
             case RidePackets.DefaultSetRq when plain.Length == 6: return await SetDefaultRideAsync(BitConverter.ToInt32(plain, 2), ct);
             case 0x562f when plain.Length == 10 && inventory.ContainsKey(BitConverter.ToInt64(plain, 2)):
                 return await SoulBindCompleteAsync(BitConverter.ToInt64(plain, 2), ct);
+            // Soul-bind attune (0x5631, 24 bytes: uid i64, select stat i16, select skill i32, cost uid i64). The live
+            // client leaves the soul-bind window hanging if this goes unanswered.
+            case 0x5631 when plain.Length == 24:
+                return await SoulBindAttuneAsync(BitConverter.ToInt64(plain, 2), BitConverter.ToInt16(plain, 10),
+                    BitConverter.ToInt32(plain, 12), BitConverter.ToInt64(plain, 16), ct);
             case 0x3704 when plain.Length == 10: return SprintOn(now);
             // Glide (0x3706) and flight (0x370a) starts, sent once a wing is equipped (live 2026-10-15).
             case 0x3706 when resources is not null && wingId != 0:
@@ -638,7 +645,7 @@ public sealed partial class GameSession(GameData data, GameSessionOptions option
             case 0x3708 when plain.Length >= 11: return GlideBuoyancyOn(plain);
             case 0x3709 when plain.Length >= 10: return GlideBuoyancyOff(plain);
             case 0x3719 when plain.Length >= 27: return RequestAirPath(plain);
-            case 0x3705 when plain.Length == 10: return SprintOff();
+            case 0x3705 when plain.Length == 10: return SprintOff(now);
             // CharRestStart_RQ / CharRestStop_RQ {key varint, 0 OBSERVED "473700"}: sit down / stand up (dev 0x36A4-0x36A9,
             // usmap layouts; no official reply sample, CANDIDATE). Others see the NT.
             // Per-character settings (GameSession.Settings.cs).
@@ -890,7 +897,9 @@ public sealed partial class GameSession(GameData data, GameSessionOptions option
         // burst). Writing the sprint reply on its own let this client enter the sprint a frame before the dash, and it then
         // never left the dash (live 2026-10-20, variants 1-5). Variants 7-9 hold the reply for that batch.
         List<byte[]> reply = [GamePackets.SprintCooltime(playerKey), GamePackets.SprintOnReply(playerKey)];
-        if (DashVariant is 7 or 8 or 9)
+        if (WireContext.IsModern && DashVariant == 0) DashVariant = 11;
+        sprintReassertUsed = false;
+        if (DashVariant is 7 or 8 or 9 or 11)
         {
             pendingSprintReply = reply;
             pendingDashBatch = null;
@@ -905,7 +914,7 @@ public sealed partial class GameSession(GameData data, GameSessionOptions option
     /// </summary>
     List<byte[]> DeliverDash(List<byte[]> dash, int variant)
     {
-        if (variant == 8)
+        if (variant is 8 or 11)
         {
             pendingDashBatch = dash;
             return [];
@@ -931,7 +940,7 @@ public sealed partial class GameSession(GameData data, GameSessionOptions option
     List<byte[]> FlushHeldDash(long now)
     {
         if (pendingSprintReply is null && pendingDashBatch is null) return [];
-        if (now < sprintOnAt + (DashVariant == 8 ? DashBatchDelayMs : SprintReplyHoldMs)) return [];
+        if (now < sprintOnAt + (DashVariant is 8 or 11 ? DashBatchDelayMs : SprintReplyHoldMs)) return [];
         var replies = TakePendingSprint();
         if (pendingDashBatch is { } dash)
         {
@@ -986,8 +995,24 @@ public sealed partial class GameSession(GameData data, GameSessionOptions option
         return replies;
     }
 
-    List<byte[]> SprintOff()
+    List<byte[]> SprintOff(long now)
     {
+        // Variant 11: the client ends the sprint itself right after its opening roll is accepted. A sprint
+        // started on a mount keeps running on foot, so re-assert it once instead of ending it.
+        if (DashVariant == 11 && sprinting && !sprintReassertUsed && !dead && resources is { Sp: > 0 }
+            && now - sprintOnAt <= SprintAutoDodgeWindowMs + 100)
+        {
+            sprintReassertUsed = true;
+            var held = TakePendingSprint();
+            if (pendingDashBatch is { } pendingDash)
+            {
+                pendingDashBatch = null;
+                held.AddRange(pendingDash);
+            }
+            sprintOnAt = now;
+            sprintTickAt = now + SprintTickMs;
+            return held.Count > 0 ? held : [GamePackets.SprintCooltime(playerKey), GamePackets.SprintOnReply(playerKey)];
+        }
         sprinting = false;
         // A sprint the client released before the held reply went out still has to be seen, or the off notice has nothing to end.
         var replies = TakePendingSprint();
@@ -1083,7 +1108,7 @@ public sealed partial class GameSession(GameData data, GameSessionOptions option
         var kept = new Dictionary<long, int>();
         foreach (var i in items.Where(i => i.Location is "bag" or "storage" or "account_storage" && i.Slot is null))
         {
-            var container = i.Location switch { "storage" => InventoryItem.Storage, "account_storage" => InventoryItem.AccountStorage, _ => InventoryItem.Bag };
+            var container = ContainerOf(i.Location);
             if (shown?.GetValueOrDefault(WireKey(i)) is { } was && was.Container == container && used[i.Location].Add(was.Slot))
                 kept[WireKey(i)] = was.Slot;
         }
@@ -1106,12 +1131,7 @@ public sealed partial class GameSession(GameData data, GameSessionOptions option
             }
             var key = item.WireId > 0 ? item.WireId : BitConverter.ToInt64(item.InstanceId.ToByteArray(), 0) & long.MaxValue;
             var equipment = equipped || data?.Item(item.TemplateId) is not null;
-            var container = equipped ? InventoryItem.Equipped : item.Location switch
-            {
-                "storage" => InventoryItem.Storage,
-                "account_storage" => InventoryItem.AccountStorage,
-                _ => InventoryItem.Bag,
-            };
+            var container = equipped ? InventoryItem.Equipped : ContainerOf(item.Location);
             result.Add(new InventoryItem(key, item.TemplateId, item.Quantity, container, slot,
                 // Item level: its own, the enchant's and the manastone grades' (OBSERVED 2026-11-06 234912: 23 + grades; GameSession.Imprint.cs).
                 equipment ? new EquipDetail((data?.ItemLevel(item.TemplateId) ?? 1) + Enchants.Effect(item.TemplateId, EnchantOf(item)).ItemLevel
@@ -1146,6 +1166,42 @@ public sealed partial class GameSession(GameData data, GameSessionOptions option
             .. Emit(new AchievementEvent("SoulbindTry")),
             .. Emit(new AchievementEvent("SoulbindMax", SetValue: count))];
         if (row.Location == "equipment" && stats is { Count: > 0 }) replies.AddRange(RefreshStats());
+        return replies;
+    }
+
+    /// <summary>
+    /// 0x5631 ItemSoulBindAttune_RQ: the bound item takes the selected stat from its soul-bind pool (the cost item
+    /// is used up), answered 0x5632. A stat outside the item's pool, an unbound item or a missing cost is result 1.
+    /// </summary>
+    async Task<List<byte[]>> SoulBindAttuneAsync(long key, short selectStat, int selectSkill, long costUid, CancellationToken ct)
+    {
+        List<byte[]> Fail() => [GamePackets.SoulBindAttune(key, selectStat, selectSkill, false, (0, 0), (0, 0), 1)];
+        if (Store is not { } store || CharacterId is not { } character || !storedItems.TryGetValue(key, out var row)
+            || SoulBindCount(row) == 0 || !storedItems.TryGetValue(costUid, out var cost)
+            || cost.InstanceId == row.InstanceId || cost.Location != "bag" || cost.Quantity < 1
+            || SoulBindPools.Of(row.TemplateId) is not { } binding
+            || binding.Pool.FirstOrDefault(p => p[0] == selectStat) is not { } pool)
+            return Fail();
+        // Attune replaces the selected stat with a different random pool stat (keeping the same type made the
+        // option look unchanged in the window: 5 live attunes all returned type 318 with only the value moving).
+        var held = SoulBindHeld(row);
+        var heldTypes = held.Select(s => s.Type).ToHashSet();
+        var candidates = binding.Pool.Where(p => p[3] > 0 && p[0] != selectStat && !heldTypes.Contains(p[0])).ToList();
+        if (candidates.Count == 0) candidates = binding.Pool.Where(p => p[3] > 0 && p[0] != selectStat).ToList();
+        if (candidates.Count == 0) return Fail();
+        var roll = rng.NextInt64(candidates.Sum(p => (long)p[3]));
+        var pick = candidates.First(p => (roll -= p[3]) < 0);
+        var newType = pick[0];
+        var value = rng.Next(pick[1], pick[2] + 1);
+        var stats = held.Where(s => s.Type != selectStat).Append((Type: newType, Value: value))
+            .OrderBy(s => s.Type).ToList();
+        var used = await Stored(async () => await store.ConsumeItemAsync(character, cost.InstanceId, cost.Revision, 1, ct) ? [Array.Empty<byte>()] : []);
+        if (used.Count == 0) return Fail();
+        var saved = await Stored(async () => await store.SoulBindItemAsync(character, row.InstanceId, SoulBindCount(row), ct, stats) ? [Array.Empty<byte>()] : []);
+        if (saved.Count == 0) return Fail();
+        List<byte[]> replies = [GamePackets.SoulBindAttune(key, selectStat, selectSkill, true, (newType, value), (0, 0)),
+            .. await InventoryChangesAsync(ct)];
+        if (row.Location == "equipment") replies.AddRange(RefreshStats());
         return replies;
     }
 
@@ -1552,6 +1608,16 @@ public sealed partial class GameSession(GameData data, GameSessionOptions option
                 if (!candidates.Contains((uint)state.WireId)) throw new ArgumentException("Character identity mismatch");
                 var profile = StoredProfile(state);
                 var savedAt = StoredCharacters.Position(state);
+                // A zero/non-finite saved position (a stuck client reports 0,0,0) spawns the character in the void: use
+                // the map's own start instead.
+                if (!savedAt.IsFinite || Math.Abs(savedAt.X) + Math.Abs(savedAt.Y) + Math.Abs(savedAt.Z) < 1)
+                {
+                    savedAt = data.MapStart(state.Progress.MapId ?? GamePackets.SpawnMapId)?.Position ?? GamePackets.SpawnPosition;
+                    // MapStart for the open-world maps is an overview point (Z ~25,000, far from the playfield): the
+                    // client spawns there and falls forever. Map 1010's town ground is the point the official server enters at.
+                    if (state.Progress.MapId == 1010 && Math.Abs(savedAt.Z) > 5000)
+                        savedAt = new Vector3d(95539.921875, -191087.828125, 72.0);
+                }
                 if (state.Progress.MapId is not > 0) throw new ArgumentException("Saved character has no valid map");
                 selected = state;
                 StaffRole = state.Staff ? accountRole : null;
@@ -1980,6 +2046,10 @@ public sealed partial class GameSession(GameData data, GameSessionOptions option
             replies.Add(GamePackets.MentoringRoleUpdate());
             replies.Add(GamePackets.WingList(OwnedWings()));
             replies.Add(RideInit());
+            // RideInitData's default field and the DefaultSet event are what the client's mount key reads; the event was
+            // only sent when a ride was acquired mid-session, never after a login that already owned one.
+            var initDefaultRide = defaultRide != 0 && OwnsRide(defaultRide) ? defaultRide : Rides.FirstOrDefault();
+            if (initDefaultRide != 0) replies.Add(RidePackets.DefaultSetNotice(playerKey, 0, initDefaultRide));
             replies.Add(GamePackets.GlideCooltime(playerKey));
         }
         // Respawn protection (10002) and class passives right after the own appearance (0x3633 / 0x3645).
@@ -2640,18 +2710,23 @@ public sealed partial class GameSession(GameData data, GameSessionOptions option
     /// An NPC hit lands on the player: combat starts, HP drops (official 0x8d00 for the player's key).
     /// At HP 0 the player dies (see Die); invincible HP holds.
     /// </summary>
-    internal List<byte[]> NpcHitsPlayer(int damage, long now, int killerKey = 0, int killerSkill = 0, int hitSeq = 1, Vector3d? casterAt = null)
+    internal List<byte[]> NpcHitsPlayer(int damage, long now, int killerKey = 0, int killerSkill = 0, int hitSeq = 1, Vector3d? casterAt = null,
+        bool enterCombat = true)
     {
         if (resources is null || dead) return [];
         if (killerSkill > 0) lastNpcHitSkill = killerSkill;
         damage = DungeonBossDamage(damage, killerKey);
         var replies = new List<byte[]>();
-        if (!inCombat)
+        // Fall damage has no attacker: the official client does not draw the weapon or enter combat for it.
+        if (enterCombat)
         {
-            inCombat = true;
-            replies.Add(GamePackets.CombatState(playerKey, true));
+            if (!inCombat)
+            {
+                inCombat = true;
+                replies.Add(GamePackets.CombatState(playerKey, true));
+            }
+            combatUntil = now + CombatTimeoutMs;
         }
-        combatUntil = now + CombatTimeoutMs;
         replies.AddRange(PlayerDamageReplies(damage, killerKey, now));
         if (!dead && killerSkill > 0)
             replies.AddRange(NpcSkillAbnormals(killerKey, killerSkill, casterAt, now, damage, hitSeq));
@@ -3341,6 +3416,7 @@ public sealed partial class GameSession(GameData data, GameSessionOptions option
             // start by themselves here.
             arrivalCheckDue = false;
             replies.AddRange(MapEventPosition(arrivedAt, now));
+            mapEventPositionCheckedAt = now;
             fogCheckAt = 0;
             replies.AddRange(await UncoverFogAsync(arrivedAt, now, ct));
             replies.AddRange(await Stored(() => AutoAcquireAsync(ct)));
@@ -3442,6 +3518,7 @@ public sealed partial class GameSession(GameData data, GameSessionOptions option
         replies.AddRange(BuffTick(now));
         replies.AddRange(DropTick(now));
         replies.AddRange(MapEventTick(now));
+        replies.AddRange(MapEventStandingPositionTick(now));
         replies.AddRange(InstanceTick(now));
         replies.AddRange(AbyssTick(now));
         replies.AddRange(AirspaceWorldTick(now));
@@ -3595,6 +3672,9 @@ public sealed partial class GameSession(GameData data, GameSessionOptions option
         {
             await FlushPendingInstanceReturnAsync(ct);
             if (position is not { } at) return;
+            // Never persist the void: a client stuck on the loading screen reports 0,0,0, and the next login then
+            // spawns the character at the map origin.
+            if (!at.IsFinite || Math.Abs(at.X) + Math.Abs(at.Y) + Math.Abs(at.Z) < 1) return;
             var staleMap = selected.Progress.MapId != worldMap;
             if (!force && now < checkpointAt && !staleMap) return;
             if (at == savedPosition && !staleMap) return;

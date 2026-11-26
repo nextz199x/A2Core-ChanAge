@@ -8,12 +8,41 @@ public sealed partial class GameSession
 {
     public const ushort ItemStoreRq = 0x5642, ItemStoreRs = 0x5643, ItemTakeOutRq = 0x5644, ItemTakeOutRs = 0x5645;
 
-    static string? ContainerToLocation(int storeContainerType) => storeContainerType switch
-    {
-        InventoryItem.Storage => "storage",
-        InventoryItem.AccountStorage or CharacterStorageContainer => "account_storage",
-        _ => null,
-    };
+    /// <summary>
+    /// The stored location of an inbound EItemContainerType. 2.0.12 swapped the warehouses: 15
+    /// (kCharacterStorage) is the per-character warehouse and 2 (kStorage)/3 its account alias; 2.0.9
+    /// keeps 2 for the per-character warehouse and 3/15 for the account one.
+    /// </summary>
+    internal static string? ContainerToLocation(int storeContainerType) => WireContext.IsModern
+        ? storeContainerType switch
+        {
+            InventoryItem.Bag => "bag",
+            CharacterStorageContainer => "storage",
+            InventoryItem.Storage or InventoryItem.AccountStorage => "account_storage",
+            _ => null,
+        }
+        : storeContainerType switch
+        {
+            InventoryItem.Bag => "bag",
+            InventoryItem.Storage => "storage",
+            InventoryItem.AccountStorage or CharacterStorageContainer => "account_storage",
+            _ => null,
+        };
+
+    /// <summary>The wire EItemContainerType of a stored location (equipment has its own container 11).</summary>
+    internal static byte ContainerOf(string location) => WireContext.IsModern
+        ? location switch
+        {
+            "storage" => CharacterStorageContainer,
+            "account_storage" => InventoryItem.Storage,
+            _ => InventoryItem.Bag,
+        }
+        : location switch
+        {
+            "storage" => InventoryItem.Storage,
+            "account_storage" => InventoryItem.AccountStorage,
+            _ => InventoryItem.Bag,
+        };
 
     static byte[] ItemStoreReply(ushort opcode, int result, int npc, IReadOnlyList<(long Key, long Count)> items, int storeContainerType)
     {
@@ -47,18 +76,22 @@ public sealed partial class GameSession
 
     static bool CanTransferToWarehouse(ItemState row) => SoulBindCount(row) == 0;
 
-    int DestinationSlotLimit(string location) => location switch
+    /// <summary>
+    /// The destination slot limit of a wire EItemContainerType. Keyed by the client's container id so the
+    /// 2.0.12 swap (15 = character warehouse, 2 = account warehouse) reads the matching extension counters.
+    /// </summary>
+    int SlotLimitFor(int container) => container switch
     {
-        "storage" => containerSlotExtends.StorageSlotLimit,
-        "account_storage" => containerSlotExtends.AccountStorageSlotLimit,
-        "bag" => containerSlotExtends.BagSlotLimit,
+        InventoryItem.Bag => containerSlotExtends.BagSlotLimit,
+        InventoryItem.Storage => containerSlotExtends.StorageSlotLimit,
+        CharacterStorageContainer or InventoryItem.AccountStorage => containerSlotExtends.AccountStorageSlotLimit,
         _ => 0,
     };
 
     async Task<List<byte[]>> ItemStoreAsync(byte[] plain, CancellationToken ct)
     {
         if (!TryParseStorePacket(plain, out var npc, out var items, out var storeContainerType)
-            || ContainerToLocation(storeContainerType) is not { } toLocation
+            || ContainerToLocation(storeContainerType) is not { } toLocation || toLocation is "bag"
             || Store is not { } store || CharacterId is not { } character || items.Count == 0)
             return [ItemStoreReply(ItemStoreRs, 1, npc, items, storeContainerType)];
 
@@ -74,7 +107,7 @@ public sealed partial class GameSession
         var outcome = "none";
         await Stored(async () =>
         {
-            outcome = await store.TransferContainerItemsAsync(character, "bag", toLocation, transfers, DestinationSlotLimit(toLocation), ct);
+            outcome = await store.TransferContainerItemsAsync(character, "bag", toLocation, transfers, SlotLimitFor(storeContainerType), ct);
             return outcome == "ok" ? [[]] : [];
         });
         if (outcome != "ok")
@@ -90,7 +123,7 @@ public sealed partial class GameSession
     async Task<List<byte[]>> ItemTakeOutAsync(byte[] plain, CancellationToken ct)
     {
         if (!TryParseStorePacket(plain, out var npc, out var items, out var storeContainerType)
-            || ContainerToLocation(storeContainerType) is not { } fromLocation
+            || ContainerToLocation(storeContainerType) is not { } fromLocation || fromLocation is "bag"
             || Store is not { } store || CharacterId is not { } character || items.Count == 0)
             return [ItemStoreReply(ItemTakeOutRs, 1, npc, items, storeContainerType)];
 
@@ -106,7 +139,7 @@ public sealed partial class GameSession
         var outcome = "none";
         await Stored(async () =>
         {
-            outcome = await store.TransferContainerItemsAsync(character, fromLocation, "bag", transfers, DestinationSlotLimit("bag"), ct);
+            outcome = await store.TransferContainerItemsAsync(character, fromLocation, "bag", transfers, SlotLimitFor(InventoryItem.Bag), ct);
             return outcome == "ok" ? [[]] : [];
         });
         if (outcome != "ok")

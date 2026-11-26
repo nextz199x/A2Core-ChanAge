@@ -34,8 +34,17 @@ partial class GameSession
     public const ushort SkillGroundReadyRq = 0x384a, SkillGroundReadyRs = 0x384b, SkillGroundStartRq = 0x384d, SkillGroundStartRs = 0x384e,
         SkillGroundStopRq = 0x384f, SkillGroundStopRs = 0x3850;
 
-    /// <summary>Max horizontal distance to plant on a tower: EnvObj InteractRange + <see cref="WorldObjects.InteractSlack"/> (matches InteractEnvObj_RQ).</summary>
-    public static double BombPlantReach(WorldObject tower) => tower.InteractRange + WorldObjects.InteractSlack;
+    /// <summary>Skill 5003 NeedSkillUseRange (Skill.json: 3000) lets the throw land from 30 m, not only at the
+    /// tower's 650 cm interact range. Add a small latency margin so a throw at the edge is not refused.</summary>
+    public const double BombThrowRange = 3_000, BombThrowSlack = 250;
+
+    /// <summary>Bomb throw animation length before the natural SkillEnd_NT (OURS; no capture).</summary>
+    const int BombThrowMs = 700;
+
+    /// <summary>Max horizontal distance to plant on a tower: the bomb skill's ground range (or the tower's interact
+    /// range, whichever is larger).</summary>
+    public static double BombPlantReach(WorldObject tower) =>
+        Math.Max(tower.InteractRange + WorldObjects.InteractSlack, BombThrowRange + BombThrowSlack);
 
     public static bool InBombPlantRange(Vector3d here, WorldObject tower)
     {
@@ -267,15 +276,30 @@ partial class GameSession
     {
         if (position is not { } here) return null;
         var objects = WorldObjects.ObjectsOn(worldMap);
-        var candidates = shownObjects.Where(i => i < objects.Count && EnvObjBombTowerRemaining(i, objects[i], now) && InBombPlantRange(here, objects[i]))
-            .OrderBy(i => objects[i].At.DistanceSquared(here)).ToList();
+        // Not every tower is pushed to the client's shown set while the player stands at it (map-event visibility is
+        // distance-triggered); the plant is in reach, so consider every remaining tower and let the range decide.
+        var candidates = objects.Select((o, i) => (o, i))
+            .Where(x => EnvObjBombTowerRemaining(x.i, x.o, now) && InBombPlantRange(here, x.o))
+            .OrderBy(x => x.o.At.DistanceSquared(here)).Select(x => x.i).ToList();
         if (candidates.Count == 0) return null;
         var selected = selectedTarget - WorldObjects.FirstKey;
         return candidates.Contains(selected) ? selected : candidates[0];
     }
 
+    /// <summary>Prerequisites for the carried bomb's skill, without a range check (2.0.12 Ready only enters the aim).</summary>
+    internal string BombSkillRefusalReason(long now, int skill)
+    {
+        if (resources is null) return "no_resources";
+        if (dead) return "dead";
+        if (skill == 0) return "no_skill";
+        if (CarriedGroup is null) return "not_carrying";
+        if (CarriedSkill != skill) return "wrong_skill";
+        return "ok";
+    }
+
     internal string BombPlantRefusalReason(long now, int skill)
     {
+        if (BombSkillRefusalReason(now, skill) is not "ok" and var basic) return basic;
         if (resources is null) return "no_resources";
         if (dead) return "dead";
         if (skill == 0) return "no_skill";
@@ -284,16 +308,14 @@ partial class GameSession
         if (position is not { } here) return "no_position";
         var objects = WorldObjects.ObjectsOn(worldMap);
         var selected = selectedTarget - WorldObjects.FirstKey;
-        if (selected >= 0 && selected < objects.Count && objects[selected].Destructible)
-        {
-            if (Broken(selected, now)) return "broken";
-            if (usedObjects.Contains(selected)) return "used";
-            if (!InBombPlantRange(here, objects[selected])) return "out_of_range";
-            if (!PlayerMayUseEnvObj(selected, objects[selected])) return "cannot_use";
-        }
+        // A stale selected target (another tower, or one already broken) must not block a tower that is in reach now.
+        if (selected >= 0 && selected < objects.Count && objects[selected].Destructible
+            && !Broken(selected, now) && !usedObjects.Contains(selected)
+            && InBombPlantRange(here, objects[selected]) && PlayerMayUseEnvObj(selected, objects[selected]))
+            return "ok";
         if (BombTarget(now) is not null) return "ok";
-        var near = shownObjects.Where(i => i < objects.Count && objects[i].Destructible)
-            .OrderBy(i => objects[i].At.DistanceSquared(here)).FirstOrDefault();
+        var near = objects.Select((o, i) => (o, i)).Where(x => x.o.Destructible)
+            .OrderBy(x => x.o.At.DistanceSquared(here)).Select(x => x.i).FirstOrDefault();
         if (near >= 0)
         {
             if (Broken(near, now)) return "broken";
@@ -320,6 +342,21 @@ partial class GameSession
         if (header == SkillGroundStopRq) return [PacketWriter.Opcode(SkillGroundStopRs).U16(0).ToArray()];
         var reply = header == SkillGroundReadyRq ? SkillGroundReadyRs : SkillGroundStartRs;
         var skill = plain.Length >= 6 ? BitConverter.ToInt32(plain, 2) : 0;
+        if (WireContext.IsModern && header == SkillGroundReadyRq)
+        {
+            // 2.0.12 Ready only enters the aim (0x384c); Start performs the plant.
+            var readyRefusal = BombSkillRefusalReason(now, skill);
+            if (readyRefusal is not "ok")
+            {
+                LogBombPlantRefused(reply, skill, readyRefusal);
+                return [GroundReply(reply, GroundSkillRefused, skill)];
+            }
+            return
+            [
+                GroundReply(reply, 0, skill),
+                PacketWriter.Opcode(0x384c).Varint((uint)playerKey).I32(skill).U8(1).ToArray(),
+            ];
+        }
         var refusal = BombPlantRefusalReason(now, skill);
         if (refusal is not "ok")
         {
@@ -340,7 +377,23 @@ partial class GameSession
         Note($"map_event:bomb_plant:env={tower.Env} idx={index} skill={skill} map={worldMap} at=({at.X:F0},{at.Y:F0},{at.Z:F0})");
         PlaytestDebug.Action("bomb_plant", ("env", tower.Env), ("index", index), ("skill", skill), ("map", worldMap));
         RecordQaBombTowerCredit(tower, at, now);
-        var replies = new List<byte[]> { GroundReply(reply, aimed ? 0 : GroundSkillRefused, skill) };
+        List<byte[]> replies;
+        if (WireContext.IsModern)
+        {
+            var throwUid = (byte)(actionUid = actionUid % 255 + 1);
+            var throwYaw = Math.Atan2(tower.At.Y - at.Y, tower.At.X - at.X) * 180 / Math.PI;
+            pendingSkillEnds.Add((skill, throwUid, now + BombThrowMs));
+            replies =
+            [
+                GroundReply(reply, 0, skill),
+                PlayerPackets.SkillStart(playerKey, skill, throwUid, WorldObjects.FirstKey + index, throwYaw, tower.At, AttackSpeed, 0),
+                PacketWriter.Opcode(0x3851).Varint((uint)playerKey).U16(0).I32(skill).ToArray(),
+            ];
+        }
+        else
+        {
+            replies = [GroundReply(reply, aimed ? 0 : GroundSkillRefused, skill)];
+        }
         replies.AddRange(BreakEnvObj(index, tower, now));
         foreach (var run in mapEventRuns.Where(r => !r.Finished))
             BumpBombTowerProgress(run, CountSpentBombTowers(now), BombTowerCreditsFromRun(run));
